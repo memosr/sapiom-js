@@ -57,6 +57,11 @@ export interface ScrapeInput {
   onlyMainContent?: boolean;
   /** Milliseconds to wait before reading (for content rendered by JavaScript). */
   waitFor?: number;
+  /**
+   * Oldest cached copy to accept, in ms (`0` reads fresh): lets a caller see a page it just changed.
+   * Slower, and the call fails instead of falling back to other read paths.
+   */
+  maxAge?: number;
 }
 
 export interface ScrapeMetadata {
@@ -174,6 +179,7 @@ export async function scrape(
   if (input.onlyMainContent != null)
     body.onlyMainContent = input.onlyMainContent;
   if (input.waitFor != null) body.waitFor = input.waitFor;
+  if (input.maxAge != null) body.maxAge = input.maxAge;
 
   const raw = await capabilityCall<RawScrapeResponse>("web.scrape", body, {
     transport,
