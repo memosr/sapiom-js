@@ -56,11 +56,38 @@ export type FailureReason =
   | "network"
   | "response_credential";
 
+const KNOWN_REFUSAL_REASONS = [
+  "unknown_injection",
+  "injection_expired",
+  "payment_released",
+  "key_rotated",
+  "already_relayed",
+  "relay_in_progress",
+  "card_removed",
+  "payment_not_authorized",
+  "total_changed",
+  "destination_not_allowed",
+  "card_fields_invalid",
+  "merchant_mismatch",
+  "provider_unavailable",
+] as const;
+
+/** A relay refusal reason. Any reason outside the known set is `unrecognized`. */
+export type RefusalReason =
+  | (typeof KNOWN_REFUSAL_REASONS)[number]
+  | "unrecognized";
+
+/**
+ * Event `url` is the request origin (`scheme://host[:port]`) with any held
+ * placeholder masked, `""` when unparseable, or the scheme (for example,
+ * `about:`) for opaque origins. Path, query, fragment, and userinfo are never
+ * included.
+ */
 export type InterceptorEvent =
   | { type: "paused"; url: string; method: string; targetType: string }
   | { type: "relayed"; url: string; status: number }
   | { type: "relayed_unfulfilled"; url: string; status: number }
-  | { type: "refused"; url: string; reason: string }
+  | { type: "refused"; url: string; reason: RefusalReason }
   | { type: "failed"; url: string; reason: FailureReason };
 
 export interface InterceptorHandle {
@@ -86,6 +113,25 @@ const RELAY_POLL_MAX_MS = 2_000;
 
 const TARGET_FILTER = [{ type: "page" }, { type: "iframe" }];
 const CHILD_FILTER = [{ type: "iframe" }];
+
+function eventUrl(value: string, number: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return "";
+  }
+  const origin = parsed.origin !== "null" ? parsed.origin : parsed.protocol;
+  const redacted = redactHeld(origin, number);
+  // Fail closed if masking ever leaves a held number behind.
+  return textHoldsPlaceholderNumber(redacted, number) ? "" : redacted;
+}
+
+function publicReason(reason: string): RefusalReason {
+  return (KNOWN_REFUSAL_REASONS as readonly string[]).includes(reason)
+    ? (reason as RefusalReason)
+    : "unrecognized";
+}
 
 /** GET/HEAD with no body and no held number in the URL. Safe to continue immediately. */
 function canContinueWithoutReading(
@@ -202,7 +248,7 @@ type HeldRead =
 type Decision =
   | { action: "continue" }
   | { action: "fail"; reason: FailureReason }
-  | { action: "refused"; reason: string }
+  | { action: "refused"; reason: RefusalReason }
   | { action: "relayed"; response: RelayedHttpResponse };
 
 type SettleAction = "continue" | "fail" | { fulfill: RelayedHttpResponse };
@@ -385,7 +431,7 @@ class PaymentInterceptor {
     if (this.closed) return false;
     this.emit({
       type: "failed",
-      url: this.safe(session.url || session.targetId),
+      url: session.url,
       reason: "intercept_unavailable",
     });
     await this.connection
@@ -461,7 +507,7 @@ class PaymentInterceptor {
       void failRequest(this.connection, sessionId, requestId);
       this.emit({
         type: "failed",
-        url: this.safe(request.url),
+        url: request.url,
         reason: "unknown_session",
       });
       return;
@@ -493,20 +539,18 @@ class PaymentInterceptor {
     entry: Inflight,
     request: PausedRequest,
   ): Promise<void> {
-    const safeUrl = this.safe(request.url);
     try {
-      const decision = await this.decide(entry, request, safeUrl);
-      await this.apply(entry, safeUrl, decision);
+      const decision = await this.decide(entry, request);
+      await this.apply(entry, request.url, decision);
     } catch {
       await this.settle(entry, "fail");
-      this.emit({ type: "failed", url: safeUrl, reason: "network" });
+      this.emit({ type: "failed", url: request.url, reason: "network" });
     }
   }
 
   private async decide(
     entry: Inflight,
     request: PausedRequest,
-    safeUrl: string,
   ): Promise<Decision> {
     const read = await this.readHeld(entry.sessionId, request);
     if (read.kind === "unreadable") {
@@ -517,7 +561,7 @@ class PaymentInterceptor {
     const targetType = this.sessions.get(entry.sessionId)?.type ?? "";
     this.emit({
       type: "paused",
-      url: safeUrl,
+      url: request.url,
       method: request.method,
       targetType,
     });
@@ -672,8 +716,9 @@ class PaymentInterceptor {
       return { action: "fail", reason: "unknown" };
     }
     if (response.outcome === "refused") {
-      this.logRefusalOnce(idempotencyKey, response.reason);
-      return { action: "refused", reason: response.reason };
+      const reason = publicReason(response.reason);
+      this.logRefusalOnce(idempotencyKey, reason);
+      return { action: "refused", reason };
     }
     if (textHoldsPlaceholderNumber(response.response.body, this.number)) {
       return { action: "fail", reason: "response_credential" };
@@ -681,7 +726,7 @@ class PaymentInterceptor {
     return { action: "relayed", response: response.response };
   }
 
-  private logRefusalOnce(idempotencyKey: string, reason: string): void {
+  private logRefusalOnce(idempotencyKey: string, reason: RefusalReason): void {
     if (this.loggedRefusals.has(idempotencyKey)) return;
     this.loggedRefusals.add(idempotencyKey);
     this.logger.warn("payment relay refused the paused request", { reason });
@@ -689,7 +734,7 @@ class PaymentInterceptor {
 
   private async apply(
     entry: Inflight,
-    safeUrl: string,
+    url: string,
     decision: Decision,
   ): Promise<void> {
     if (decision.action === "continue") {
@@ -698,21 +743,21 @@ class PaymentInterceptor {
     }
     if (decision.action === "fail") {
       await this.settle(entry, "fail");
-      this.emit({ type: "failed", url: safeUrl, reason: decision.reason });
+      this.emit({ type: "failed", url, reason: decision.reason });
       return;
     }
     if (decision.action === "refused") {
       await this.settle(entry, "fail");
-      this.emit({ type: "refused", url: safeUrl, reason: decision.reason });
+      this.emit({ type: "refused", url, reason: decision.reason });
       return;
     }
     const fulfilled = await this.settle(entry, { fulfill: decision.response });
     this.emit(
       fulfilled
-        ? { type: "relayed", url: safeUrl, status: decision.response.status }
+        ? { type: "relayed", url, status: decision.response.status }
         : {
             type: "relayed_unfulfilled",
-            url: safeUrl,
+            url,
             status: decision.response.status,
           },
     );
@@ -833,12 +878,15 @@ class PaymentInterceptor {
     };
   }
 
+  // Callers pass the raw request URL. It is cut to the origin here, once, so
+  // no event leaves with a path, query, or held number.
   private emit(event: InterceptorEvent): void {
+    const safe = { ...event, url: eventUrl(event.url, this.number) };
     if (this.buffering && this.backlog) {
-      this.backlog.push(event);
+      this.backlog.push(safe);
       return;
     }
-    for (const listener of this.listeners) this.deliver(listener, event);
+    for (const listener of this.listeners) this.deliver(listener, safe);
   }
 
   private deliver(listener: Listener, event: InterceptorEvent): void {
@@ -847,10 +895,6 @@ class PaymentInterceptor {
     } catch {
       // A listener must not break interception.
     }
-  }
-
-  private safe(value: string): string {
-    return redactHeld(value, this.number);
   }
 }
 

@@ -30,7 +30,7 @@ function parseCdpMessage(value: unknown):
       params: Record<string, unknown>;
       sessionId?: string;
       result?: unknown;
-      errorMessage?: string;
+      failed?: true;
     }
   | undefined {
   if (!isRecord(value)) return undefined;
@@ -40,19 +40,14 @@ function parseCdpMessage(value: unknown):
   const params = isRecord(value.params) ? value.params : {};
   const sessionId =
     typeof value.sessionId === "string" ? value.sessionId : undefined;
-  let errorMessage: string | undefined;
-  if (isRecord(value.error) && typeof value.error.message === "string") {
-    errorMessage = value.error.message;
-  } else if (value.error) {
-    errorMessage = "CDP call failed";
-  }
+  // The remote error text is dropped here so it can never reach a caller.
   return {
     ...(id !== undefined ? { id } : {}),
     ...(method !== undefined ? { method } : {}),
     params,
     ...(sessionId ? { sessionId } : {}),
     result: value.result,
-    ...(errorMessage ? { errorMessage } : {}),
+    ...(value.error ? { failed: true as const } : {}),
   };
 }
 
@@ -78,16 +73,20 @@ class WebSocketClient {
       this.closed = true;
       this.notifyClose();
     });
-    socket.on("error", (error: Error) => {
-      this.fail(
-        error instanceof Error ? error : new Error("CDP websocket error"),
-      );
+    socket.on("error", () => {
+      this.fail(new Error("CDP websocket error"));
     });
   }
 
   static connect(url: string, timeoutMs: number): Promise<WebSocketClient> {
     return new Promise((resolve, reject) => {
-      const target = new URL(url);
+      let target: URL;
+      try {
+        target = new URL(url);
+      } catch {
+        reject(new Error("CDP websocket URL is invalid"));
+        return;
+      }
       const key = crypto.randomBytes(16).toString("base64");
       const transport = target.protocol === "wss:" ? https : http;
       const request = transport.request({
@@ -130,7 +129,9 @@ class WebSocketClient {
       request.on("timeout", () =>
         fail(new Error("CDP websocket connect timeout")),
       );
-      request.on("error", fail);
+      request.on("error", () =>
+        fail(new Error("CDP websocket connect failed")),
+      );
       request.end();
     });
   }
@@ -337,8 +338,8 @@ export class CdpConnection {
       if (pending && message.id !== undefined) {
         this.pending.delete(message.id);
         clearTimeout(pending.timer);
-        if (message.errorMessage) {
-          pending.reject(new Error(`CDP ${message.errorMessage}`));
+        if (message.failed) {
+          pending.reject(new Error("CDP command failed"));
         } else {
           pending.resolve(message.result);
         }
@@ -389,7 +390,7 @@ export class CdpConnection {
       }
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`CDP ${method} timed out`));
+        reject(new Error("CDP command timed out"));
       }, timeoutMs);
       this.pending.set(id, {
         resolve,
@@ -405,12 +406,10 @@ export class CdpConnection {
             ...(sessionId ? { sessionId } : {}),
           }),
         );
-      } catch (error) {
+      } catch {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(
-          error instanceof Error ? error : new Error("CDP connection closed"),
-        );
+        reject(new Error("CDP connection closed"));
       }
     });
   }
