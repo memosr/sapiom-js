@@ -13,6 +13,7 @@ import { isRecord } from "./guards.js";
 import { silentLogger, type PayLogger } from "./logger.js";
 import {
   isRelayTimeout,
+  isRetryableRelayError,
   RelayTimeoutError,
   type PaymentRelay,
 } from "./relay.js";
@@ -25,14 +26,21 @@ export interface AttachOptions {
   profileId: string;
   /**
    * How long to wait for a terminal relay outcome before failing the paused
-   * request. `relay_in_progress` is posted again with the same idempotency
-   * key until this deadline. Identical pauses share that poll, including the
-   * backoff. Any other refusal fails the request. `outcome: "unknown"` is
-   * not sent again. A relay that ignores the abort signal still fails here.
-   * One waiter's timeout does not abort a shared flight that another waiter
-   * still holds.
+   * request. Defaults to 55 seconds. Identical pauses share one poll,
+   * including the backoff. `relay_in_progress`, a per-attempt timeout, a
+   * transport error, and HTTP 502, 503, and 504 are posted again with the
+   * same idempotency key until this deadline. Any other refusal fails the
+   * request. `outcome: "unknown"` is not sent again. A relay that ignores
+   * the abort signal still fails here. One waiter's timeout does not abort
+   * a shared flight that another waiter still holds.
    */
   timeoutMs?: number;
+  /**
+   * How long one relay POST may run before it is aborted and tried again.
+   * Defaults to 25 seconds, under the 30 second router limit. The total
+   * wait is `timeoutMs`.
+   */
+  attemptTimeoutMs?: number;
   /** Defaults to a logger that discards every line. */
   logger?: PayLogger;
 }
@@ -71,7 +79,8 @@ export type InterceptorTarget =
   | { browser(): { wsEndpoint(): string } | null }
   | { context(): { browser(): { wsEndpoint(): string } | null } | null };
 
-const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 25_000;
+const DEFAULT_TIMEOUT_MS = 55_000;
 const RELAY_POLL_INITIAL_MS = 200;
 const RELAY_POLL_MAX_MS = 2_000;
 
@@ -225,6 +234,7 @@ class PaymentInterceptor {
   private readonly loggedRefusals = new Set<string>();
   private readonly pendingArms = new Set<Promise<void>>();
   private readonly timeoutMs: number;
+  private readonly attemptTimeoutMs: number;
   private readonly logger: PayLogger;
   private backlog: InterceptorEvent[] | null = [];
   private buffering = true;
@@ -235,6 +245,8 @@ class PaymentInterceptor {
     private readonly options: AttachOptions,
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.attemptTimeoutMs =
+      options.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
     this.logger = options.logger ?? silentLogger;
   }
 
@@ -568,7 +580,49 @@ class PaymentInterceptor {
       if (this.unknownKeys.has(idempotencyKey)) {
         return { outcome: "unknown" };
       }
-      const response = await this.options.relay.relay(
+      try {
+        const response = await this.postAttempt(
+          request,
+          body,
+          pageOrigin,
+          idempotencyKey,
+          signal,
+        );
+        if (response.outcome === "unknown") {
+          this.unknownKeys.add(idempotencyKey);
+        }
+        if (!isRelayInProgress(response)) return response;
+      } catch (error) {
+        if (signal.aborted || this.closed || !isRetryableRelayError(error)) {
+          throw error;
+        }
+      }
+      poll += 1;
+      await sleep(relayPollDelayMs(poll), signal);
+    }
+  }
+
+  private async postAttempt(
+    request: PausedRequest,
+    body: string,
+    pageOrigin: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<RelayResponse> {
+    const attempt = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      attempt.abort(new RelayTimeoutError());
+    }, this.attemptTimeoutMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      attempt.abort(signal.reason);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort);
+    try {
+      return await this.options.relay.relay(
         {
           injectionRef: this.options.placeholder.injectionRef,
           profileId: this.options.profileId,
@@ -581,14 +635,14 @@ class PaymentInterceptor {
           },
           idempotencyKey,
         },
-        { signal },
+        { signal: attempt.signal },
       );
-      if (response.outcome === "unknown") {
-        this.unknownKeys.add(idempotencyKey);
-      }
-      if (!isRelayInProgress(response)) return response;
-      poll += 1;
-      await sleep(relayPollDelayMs(poll), signal);
+    } catch (error) {
+      if (timedOut && !signal.aborted) throw new RelayTimeoutError();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -1256,10 +1310,21 @@ function readAttachedSessionId(value: unknown): string | undefined {
   return value.sessionId.length > 0 ? value.sessionId : undefined;
 }
 
+const MAX_TIMER_MS = 2_147_483_647;
+
+function assertPositiveDuration(name: string, value: number | undefined): void {
+  if (value === undefined) return;
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new Error(`${name} must be a finite positive number`);
+  }
+}
+
 function assertAttachOptions(options: AttachOptions): void {
   if (typeof options.relay?.relay !== "function") {
     throw new Error("A payment relay is required");
   }
+  assertPositiveDuration("timeoutMs", options.timeoutMs);
+  assertPositiveDuration("attemptTimeoutMs", options.attemptTimeoutMs);
   if (!options.profileId) {
     throw new Error("profileId is required");
   }

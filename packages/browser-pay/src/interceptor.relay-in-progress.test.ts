@@ -838,6 +838,326 @@ describe("relay_in_progress", () => {
   });
 });
 
+function listenRelay(
+  respond: (
+    index: number,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ) => void,
+): Promise<{
+  origin: string;
+  posts: SeenPost[];
+  close: () => Promise<void>;
+}> {
+  const posts: SeenPost[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(
+        Buffer.concat(chunks).toString("utf8"),
+      ) as RelayRequest;
+      posts.push({
+        method: req.method ?? "",
+        url: req.url ?? "",
+        idempotencyKey: body.idempotencyKey,
+        requestBody: body.request.body,
+      });
+      respond(posts.length, req, res);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address() as AddressInfo;
+      resolve({
+        origin: `http://127.0.0.1:${address.port}`,
+        posts,
+        close: () =>
+          new Promise((done) => {
+            server.closeAllConnections();
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}
+
+async function driveHeldPost(options: {
+  origin: string;
+  timeoutMs: number;
+  attemptTimeoutMs?: number;
+  until: (events: InterceptorEvent[], commands: Command[]) => boolean;
+  label: string;
+  beforeDetach?: () => Promise<void>;
+}): Promise<{ events: InterceptorEvent[]; commands: Command[] }> {
+  const cdp = await startCdp();
+  const events: InterceptorEvent[] = [];
+  const handle = await attachInterceptor(cdp.url, {
+    relay: httpPaymentRelay({
+      baseUrl: options.origin,
+      apiKey: "test-key",
+      transactionId: TRANSACTION_ID,
+    }),
+    placeholder: HELD,
+    profileId: "shopify-card-vault",
+    timeoutMs: options.timeoutMs,
+    ...(options.attemptTimeoutMs === undefined
+      ? {}
+      : { attemptTimeoutMs: options.attemptTimeoutMs }),
+  });
+  handle.on((event) => events.push(event));
+  try {
+    cdp.emit({
+      method: "Target.attachedToTarget",
+      params: {
+        sessionId: "page-1",
+        waitingForDebugger: true,
+        targetInfo: {
+          targetId: "target-page",
+          type: "page",
+          url: "https://shop.example/checkout",
+        },
+      },
+    });
+    await waitFor(
+      () => cdp.commands.some((command) => command.method === "Fetch.enable"),
+      "Fetch.enable",
+    );
+    cdp.emit({
+      method: "Fetch.requestPaused",
+      sessionId: "page-1",
+      params: {
+        requestId: "req-retry",
+        request: {
+          url: CHECKOUT_URL,
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          postData: CARD,
+        },
+      },
+    });
+    await waitFor(() => options.until(events, cdp.commands), options.label);
+    if (options.beforeDetach) await options.beforeDetach();
+    return { events, commands: cdp.commands };
+  } finally {
+    await handle.detach();
+    await cdp.close();
+  }
+}
+
+function sameKey(posts: SeenPost[], idempotencyKey: string): void {
+  expect(posts.length).toBeGreaterThan(0);
+  expect(posts.every((post) => post.idempotencyKey === idempotencyKey)).toBe(
+    true,
+  );
+  expect(
+    posts.every((post) => post.method === "POST" && post.url === RELAY_PATH),
+  ).toBe(true);
+}
+
+describe("relay retry before the deadline", () => {
+  const idempotencyKey = paymentIdempotencyKey("POST", CHECKOUT_URL, CARD);
+
+  it("retries the same key after an attempt timeout and fulfills", async () => {
+    const relay = await listenRelay((index, _req, res) => {
+      if (index === 1) return;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(RELAYED));
+    });
+    try {
+      const settled = await driveHeldPost({
+        origin: relay.origin,
+        timeoutMs: 2_000,
+        attemptTimeoutMs: 80,
+        until: (_events, commands) =>
+          commands.some((command) => command.method === "Fetch.fulfillRequest"),
+        label: "fulfill after timeout",
+      });
+      expect(relay.posts.map((post) => post.idempotencyKey)).toEqual([
+        idempotencyKey,
+        idempotencyKey,
+      ]);
+      expect(count(settled.commands, "Fetch.failRequest")).toBe(0);
+      expect(count(settled.commands, "Fetch.fulfillRequest")).toBe(1);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("retries the same key after HTTP 503 and fulfills", async () => {
+    const relay = await listenRelay((index, _req, res) => {
+      if (index === 1) {
+        res.writeHead(503);
+        res.end("unavailable");
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(RELAYED));
+    });
+    try {
+      const settled = await driveHeldPost({
+        origin: relay.origin,
+        timeoutMs: 2_000,
+        until: (_events, commands) =>
+          commands.some((command) => command.method === "Fetch.fulfillRequest"),
+        label: "fulfill after 503",
+      });
+      expect(relay.posts.map((post) => post.idempotencyKey)).toEqual([
+        idempotencyKey,
+        idempotencyKey,
+      ]);
+      expect(count(settled.commands, "Fetch.failRequest")).toBe(0);
+      expect(count(settled.commands, "Fetch.fulfillRequest")).toBe(1);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("retries the same key after a transport error and fulfills", async () => {
+    const relay = await listenRelay((index, req, res) => {
+      if (index === 1) {
+        req.socket?.destroy();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(RELAYED));
+    });
+    try {
+      const settled = await driveHeldPost({
+        origin: relay.origin,
+        timeoutMs: 2_000,
+        until: (_events, commands) =>
+          commands.some((command) => command.method === "Fetch.fulfillRequest"),
+        label: "fulfill after transport error",
+      });
+      sameKey(relay.posts, idempotencyKey);
+      expect(relay.posts).toHaveLength(2);
+      expect(count(settled.commands, "Fetch.fulfillRequest")).toBe(1);
+      expect(count(settled.commands, "Fetch.failRequest")).toBe(0);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("fails with timeout when retries exhaust the deadline", async () => {
+    const relay = await listenRelay((_index, _req, res) => {
+      res.writeHead(503);
+      res.end("unavailable");
+    });
+    try {
+      const settled = await driveHeldPost({
+        origin: relay.origin,
+        timeoutMs: 900,
+        until: (events) => events.some((event) => event.type === "failed"),
+        label: "deadline",
+      });
+      sameKey(relay.posts, idempotencyKey);
+      expect(relay.posts.length).toBeGreaterThanOrEqual(2);
+      expect(count(settled.commands, "Fetch.failRequest")).toBe(1);
+      expect(count(settled.commands, "Fetch.fulfillRequest")).toBe(0);
+      expect(settled.events).toContainEqual(
+        expect.objectContaining({ type: "failed", reason: "timeout" }),
+      );
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("does not retry an HTTP 500", async () => {
+    const relay = await listenRelay((_index, _req, res) => {
+      res.writeHead(500);
+      res.end("application error");
+    });
+    try {
+      const settled = await driveHeldPost({
+        origin: relay.origin,
+        timeoutMs: 2_000,
+        until: (events) => events.some((event) => event.type === "failed"),
+        label: "500",
+        beforeDetach: () => new Promise((resolve) => setTimeout(resolve, 400)),
+      });
+      expect(relay.posts.map((post) => post.idempotencyKey)).toEqual([
+        idempotencyKey,
+      ]);
+      expect(count(settled.commands, "Fetch.failRequest")).toBe(1);
+      expect(settled.events).toContainEqual(
+        expect.objectContaining({ type: "failed", reason: "network" }),
+      );
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("aborts one shared attempt and fulfills both pauses", async () => {
+    const cdp = await startCdp();
+    let calls = 0;
+    let attemptStarted = 0;
+    const aborts: number[] = [];
+    const handle = await attachInterceptor(cdp.url, {
+      relay: {
+        relay(_request, options) {
+          calls += 1;
+          if (calls === 1) {
+            attemptStarted = Date.now();
+            return new Promise((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => {
+                aborts.push(Date.now() - attemptStarted);
+                reject(new Error("aborted"));
+              });
+            });
+          }
+          return Promise.resolve(RELAYED);
+        },
+      },
+      placeholder: HELD,
+      profileId: "shopify-card-vault",
+      timeoutMs: 2_000,
+      attemptTimeoutMs: 120,
+    });
+    try {
+      armPage(cdp);
+      await waitFor(
+        () => cdp.commands.some((command) => command.method === "Fetch.enable"),
+        "Fetch.enable",
+      );
+      emitPaused(cdp, "req-shared-a");
+      await waitFor(() => calls === 1, "first attempt");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      emitPaused(cdp, "req-shared-b");
+      await waitFor(
+        () => count(cdp.commands, "Fetch.fulfillRequest") === 2,
+        "both fulfilled",
+      );
+      expect(calls).toBe(2);
+      expect(aborts).toHaveLength(1);
+      expect(aborts[0]).toBeGreaterThanOrEqual(100);
+      expect(aborts[0]).toBeLessThan(160);
+      expect(count(cdp.commands, "Fetch.failRequest")).toBe(0);
+    } finally {
+      await handle.detach();
+      await cdp.close();
+    }
+  });
+
+  it("rejects a timeout that is not a finite positive number", async () => {
+    const relay = { relay: async () => RELAYED };
+    const base = {
+      relay,
+      placeholder: HELD,
+      profileId: "shopify-card-vault",
+    };
+    await expect(
+      attachInterceptor("ws://127.0.0.1:9", { ...base, timeoutMs: Number.NaN }),
+    ).rejects.toThrow(/timeoutMs/);
+    await expect(
+      attachInterceptor("ws://127.0.0.1:9", { ...base, attemptTimeoutMs: 0 }),
+    ).rejects.toThrow(/attemptTimeoutMs/);
+    await expect(
+      attachInterceptor("ws://127.0.0.1:9", { ...base, timeoutMs: 2 ** 31 }),
+    ).rejects.toThrow(/timeoutMs/);
+  });
+});
+
 function armPage(cdp: {
   emit: (event: Record<string, unknown>) => void;
 }): void {
