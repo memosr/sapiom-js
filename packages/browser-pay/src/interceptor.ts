@@ -24,10 +24,13 @@ export interface AttachOptions {
   /** Relay profile, for example `shopify-card-vault`. */
   profileId: string;
   /**
-   * How long to wait for the relay before failing the paused request.
-   * The relay is not retried. `outcome: "unknown"` is not sent again.
-   * A relay that ignores the abort signal still fails here. One waiter's
-   * timeout does not abort a shared flight that another waiter still holds.
+   * How long to wait for a terminal relay outcome before failing the paused
+   * request. `relay_in_progress` is posted again with the same idempotency
+   * key until this deadline. Identical pauses share that poll, including the
+   * backoff. Any other refusal fails the request. `outcome: "unknown"` is
+   * not sent again. A relay that ignores the abort signal still fails here.
+   * One waiter's timeout does not abort a shared flight that another waiter
+   * still holds.
    */
   timeoutMs?: number;
   /** Defaults to a logger that discards every line. */
@@ -69,6 +72,8 @@ export type InterceptorTarget =
   | { context(): { browser(): { wsEndpoint(): string } | null } | null };
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const RELAY_POLL_INITIAL_MS = 200;
+const RELAY_POLL_MAX_MS = 2_000;
 
 const TARGET_FILTER = [{ type: "page" }, { type: "iframe" }];
 const CHILD_FILTER = [{ type: "iframe" }];
@@ -523,14 +528,68 @@ class PaymentInterceptor {
     if (this.unknownKeys.has(idempotencyKey)) {
       return { action: "fail", reason: "unknown" };
     }
-    const relayed = await this.callRelay(
-      request,
-      read.body,
-      pageOrigin,
-      idempotencyKey,
+    return this.awaitRelay(request, read.body, pageOrigin, idempotencyKey);
+  }
+
+  private async awaitRelay(
+    request: PausedRequest,
+    body: string,
+    pageOrigin: string,
+    idempotencyKey: string,
+  ): Promise<Decision> {
+    const flight = this.relayOnce(idempotencyKey, (signal) =>
+      this.pollRelay(request, body, pageOrigin, idempotencyKey, signal),
     );
-    if (relayed.action === "fail") return relayed;
-    return this.decisionForOutcome(relayed.response, idempotencyKey);
+    let response: RelayResponse;
+    try {
+      response = await failAfter(flight.promise, this.timeoutMs);
+    } catch (error) {
+      this.releaseWaiter(flight);
+      return {
+        action: "fail",
+        reason: this.closed ? "detached" : failureReason(error),
+      };
+    }
+    this.releaseWaiter(flight);
+    if (this.closed) return { action: "fail", reason: "detached" };
+    return this.decisionForOutcome(response, idempotencyKey);
+  }
+
+  private async pollRelay(
+    request: PausedRequest,
+    body: string,
+    pageOrigin: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<RelayResponse> {
+    let poll = 0;
+    for (;;) {
+      if (signal.aborted || this.closed) throw abortError(signal);
+      if (this.unknownKeys.has(idempotencyKey)) {
+        return { outcome: "unknown" };
+      }
+      const response = await this.options.relay.relay(
+        {
+          injectionRef: this.options.placeholder.injectionRef,
+          profileId: this.options.profileId,
+          pageOrigin,
+          request: {
+            method: request.method,
+            url: request.url,
+            headers: forwardedHeaders(request.headers),
+            body,
+          },
+          idempotencyKey,
+        },
+        { signal },
+      );
+      if (response.outcome === "unknown") {
+        this.unknownKeys.add(idempotencyKey);
+      }
+      if (!isRelayInProgress(response)) return response;
+      poll += 1;
+      await sleep(relayPollDelayMs(poll), signal);
+    }
   }
 
   private async readHeld(
@@ -548,45 +607,6 @@ class PaymentInterceptor {
       return { kind: "held", body };
     }
     return { kind: "miss" };
-  }
-
-  private async callRelay(
-    request: PausedRequest,
-    body: string,
-    pageOrigin: string,
-    idempotencyKey: string,
-  ): Promise<
-    | { action: "ok"; response: RelayResponse }
-    | { action: "fail"; reason: FailureReason }
-  > {
-    const flight = this.relayOnce(idempotencyKey, (signal) =>
-      this.options.relay.relay(
-        {
-          injectionRef: this.options.placeholder.injectionRef,
-          profileId: this.options.profileId,
-          pageOrigin,
-          request: {
-            method: request.method,
-            url: request.url,
-            headers: forwardedHeaders(request.headers),
-            body,
-          },
-          idempotencyKey,
-        },
-        { signal },
-      ),
-    );
-    try {
-      const response = await failAfter(flight.promise, this.timeoutMs);
-      this.releaseWaiter(flight);
-      return { action: "ok", response };
-    } catch (error) {
-      this.releaseWaiter(flight);
-      return {
-        action: "fail",
-        reason: this.closed ? "detached" : failureReason(error),
-      };
-    }
   }
 
   private decisionForOutcome(
@@ -782,6 +802,42 @@ class PaymentInterceptor {
 
 function inflightKey(sessionId: string, requestId: string): string {
   return `${sessionId}\n${requestId}`;
+}
+
+function isRelayInProgress(response: RelayResponse): boolean {
+  return (
+    response.outcome === "refused" && response.reason === "relay_in_progress"
+  );
+}
+
+function relayPollDelayMs(attempt: number): number {
+  const shift = Math.min(Math.max(attempt, 1) - 1, 10);
+  return Math.min(RELAY_POLL_INITIAL_MS * 2 ** shift, RELAY_POLL_MAX_MS);
+}
+
+function abortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function failureReason(error: unknown): FailureReason {
